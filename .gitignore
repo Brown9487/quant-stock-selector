@@ -1,0 +1,11 @@
+.DS_Store
+.venv/
+.codex/
+__pycache__/
+*.py[cod]
+
+.hist_cache/
+run_full.log
+trend_selector_results_run*.xlsx
+~$trend_selector_results_run*.xlsx
+~$*.xlsx
