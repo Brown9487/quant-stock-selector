@@ -1013,7 +1013,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stock-rps20-min", type=float, default=60.0)
     parser.add_argument("--stock-per-industry", type=int, default=5)
     parser.add_argument("--stock-min-mkt-cap-yi", type=float, default=50.0, help="最小总市值(亿元), <=0 表示不启用")
-    parser.add_argument("--stock-data-max-staleness-days", type=int, default=1, help="个股数据允许最大滞后天数")
+    parser.add_argument("--stock-data-max-staleness-days", type=int, default=0, help="个股数据允许最大滞后天数；0 表示必须为当天数据")
     parser.add_argument("--component-min-coverage-ratio", type=float, default=0.8, help="行业成分映射最低覆盖率")
     parser.add_argument("--component-cache-max-age-days", type=int, default=5, help="行业成分缓存允许最大滞后天数")
     parser.add_argument(
