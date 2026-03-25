@@ -10,6 +10,7 @@ import os
 import re
 import time
 import tempfile
+import threading
 from dataclasses import dataclass
 import fcntl
 from datetime import datetime, timedelta
@@ -37,6 +38,7 @@ except Exception:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _SW2_NAME_MAP_CACHE: dict[str, str] | None = None
 _SW3_INFO_CACHE: pd.DataFrame | None = None
+_SINA_DAILY_LOCK = threading.Lock()
 
 
 @dataclass
@@ -45,7 +47,7 @@ class Config:
     end_date: str
     output_dir: str = SCRIPT_DIR
     hist_cache_dir: str = ".hist_cache"
-    industry_top_n: int = 10
+    industry_top_n: int = 7
     industry_rps50_min: float = 60.0
     industry_rps20_min: float = 60.0
     industry_delta_rps20_min: float = 15.0
@@ -386,26 +388,30 @@ def _resolve_cache_dir(hist_cache_dir: str) -> str:
 def _load_hist_cache(ts_code: str, start_date: str, end_date: str, cache_dir: str) -> pd.DataFrame:
     path = _hist_cache_path(cache_dir, ts_code)
     if not os.path.exists(path):
-        return pd.DataFrame(columns=["ts_code", "trade_date", "close"])
+        return pd.DataFrame(columns=["ts_code", "trade_date", "close", "volume"])
     try:
         df = pd.read_csv(path, dtype={"ts_code": str, "trade_date": str})
     except Exception:
-        return pd.DataFrame(columns=["ts_code", "trade_date", "close"])
+        return pd.DataFrame(columns=["ts_code", "trade_date", "close", "volume"])
 
     if not {"ts_code", "trade_date", "close"}.issubset(df.columns):
-        return pd.DataFrame(columns=["ts_code", "trade_date", "close"])
+        return pd.DataFrame(columns=["ts_code", "trade_date", "close", "volume"])
 
     df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+    else:
+        df["volume"] = pd.NA
     df = df.dropna(subset=["trade_date", "close"])
     s = pd.to_datetime(start_date)
     e = pd.to_datetime(end_date)
     df = df[(df["trade_date"] >= s) & (df["trade_date"] <= e)].copy()
     if df.empty:
-        return pd.DataFrame(columns=["ts_code", "trade_date", "close"])
+        return pd.DataFrame(columns=["ts_code", "trade_date", "close", "volume"])
     df["trade_date"] = df["trade_date"].dt.strftime("%Y%m%d")
     df["ts_code"] = ts_code
-    return df[["ts_code", "trade_date", "close"]]
+    return df[["ts_code", "trade_date", "close", "volume"]]
 
 
 def _save_hist_cache(df: pd.DataFrame, cache_dir: str) -> None:
@@ -414,7 +420,10 @@ def _save_hist_cache(df: pd.DataFrame, cache_dir: str) -> None:
     ts_code = str(df.iloc[0]["ts_code"])
     out = df.copy()
     out["trade_date"] = pd.to_datetime(out["trade_date"], errors="coerce").dt.strftime("%Y%m%d")
-    out = out[["ts_code", "trade_date", "close"]].dropna(subset=["trade_date", "close"])
+    if "volume" not in out.columns:
+        out["volume"] = pd.NA
+    out["volume"] = pd.to_numeric(out["volume"], errors="coerce")
+    out = out[["ts_code", "trade_date", "close", "volume"]].dropna(subset=["trade_date", "close"])
 
     target = _hist_cache_path(cache_dir, ts_code)
     os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -448,24 +457,65 @@ def _is_hist_cache_stale(hist: pd.DataFrame, end_date: str, max_lag_days: int = 
 
 
 def _fetch_stock_hist(ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-    try:
-        raw = ak.stock_zh_a_hist_tx(
-            symbol=_to_ak_symbol(ts_code),
-            start_date=pd.to_datetime(start_date).strftime("%Y%m%d"),
-            end_date=pd.to_datetime(end_date).strftime("%Y%m%d"),
-            adjust="qfq",
-            timeout=10,
-        )
-        if raw is None or raw.empty:
-            return pd.DataFrame(columns=["ts_code", "trade_date", "close"])
-        out = raw[["date", "close"]].copy()
-        out.columns = ["trade_date", "close"]
+    start_tag = pd.to_datetime(start_date).strftime("%Y%m%d")
+    end_tag = pd.to_datetime(end_date).strftime("%Y%m%d")
+    ak_symbol = _to_ak_symbol(ts_code)
+
+    def _normalize_frame(df: pd.DataFrame, date_col: str, close_col: str, volume_col: str) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["ts_code", "trade_date", "close", "volume"])
+        out = df[[date_col, close_col, volume_col]].copy()
+        out.columns = ["trade_date", "close", "volume"]
         out["trade_date"] = pd.to_datetime(out["trade_date"], errors="coerce").dt.strftime("%Y%m%d")
         out["close"] = pd.to_numeric(out["close"], errors="coerce")
+        out["volume"] = pd.to_numeric(out["volume"], errors="coerce")
         out["ts_code"] = ts_code
-        return out.dropna(subset=["trade_date", "close"])
+        return out.dropna(subset=["trade_date", "close", "volume"])
+
+    # 当前环境下东财接口频繁 RemoteDisconnected，优先走新浪；失败再退回腾讯。
+    try:
+        with _SINA_DAILY_LOCK:
+            raw = _run_with_retry(
+                lambda: ak.stock_zh_a_daily(symbol=ak_symbol, start_date=start_tag, end_date=end_tag, adjust="qfq"),
+                max_retries=3,
+                base_sleep=1.0,
+                timeout=20.0,
+            )
+        out = _normalize_frame(raw, "date", "close", "volume")
+        if not out.empty:
+            return out
     except Exception:
-        return pd.DataFrame(columns=["ts_code", "trade_date", "close"])
+        pass
+
+    try:
+        raw = _run_with_retry(
+            lambda: ak.stock_zh_a_hist_tx(
+                symbol=ak_symbol,
+                start_date=start_tag,
+                end_date=end_tag,
+                adjust="qfq",
+                timeout=10,
+            ),
+            max_retries=3,
+            base_sleep=1.0,
+            timeout=30.0,
+        )
+        # 腾讯接口返回的 amount 在这里作为量能代理，仅用于相对放量比较。
+        out = _normalize_frame(raw, "date", "close", "amount")
+        if not out.empty:
+            return out
+    except Exception:
+        pass
+
+    return pd.DataFrame(columns=["ts_code", "trade_date", "close", "volume"])
+
+
+def _is_st_stock_name(name: object) -> bool:
+    normalized = str(name or "").strip().upper().replace(" ", "")
+    if not normalized:
+        return False
+    normalized = normalized.replace("Ｓ", "S").replace("Ｔ", "T").replace("*", "")
+    return normalized.startswith(("ST", "SST"))
 
 
 def _load_stock_data(config: Config, target_codes: list[str]) -> pd.DataFrame:
@@ -485,9 +535,11 @@ def _load_stock_data(config: Config, target_codes: list[str]) -> pd.DataFrame:
 
     def _load_one(ts_code: str) -> pd.DataFrame:
         hist = _load_hist_cache(ts_code, config.start_date, config.end_date, cache_dir)
+        missing_volume = ("volume" not in hist.columns) or hist["volume"].isna().all()
         should_refresh = _is_hist_cache_stale(
             hist, config.end_date, max_lag_days=max(0, int(config.stock_data_max_staleness_days))
         )
+        should_refresh = should_refresh or missing_volume
         from_cache_only = (not hist.empty) and (not should_refresh)
         if should_refresh:
             fresh = _fetch_stock_hist(ts_code, config.start_date, config.end_date)
@@ -499,7 +551,7 @@ def _load_stock_data(config: Config, target_codes: list[str]) -> pd.DataFrame:
                 hist = fresh
                 refresh_status = "refresh_failed_empty"
             else:
-                print(f"warning: {ts_code} 缓存较旧且 akshare 刷新失败，继续使用旧缓存。")
+                print(f"warning: {ts_code} 缓存缺失成交量或较旧，且 akshare 刷新失败，继续使用旧缓存。")
                 refresh_status = "refresh_failed_fallback_cache"
         else:
             refresh_status = "cache_hit" if from_cache_only else "unknown"
@@ -572,6 +624,7 @@ def _compute_stock_factors(stock_df: pd.DataFrame, stock_rps20_min: float) -> pd
     out = stock_df.copy().sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
     out["trade_date"] = pd.to_datetime(out["trade_date"], errors="coerce")
     out = out.dropna(subset=["trade_date", "close"]).copy()
+    out["volume"] = pd.to_numeric(out.get("volume"), errors="coerce")
 
     g = out.groupby("ts_code")
     out["ret_20"] = g["close"].transform(lambda x: x / x.shift(20) - 1)
@@ -581,20 +634,28 @@ def _compute_stock_factors(stock_df: pd.DataFrame, stock_rps20_min: float) -> pd
     out["RPS60"] = out.groupby("trade_date")["ret_60"].rank(pct=True, ascending=True) * 100
     out["RPS120"] = out.groupby("trade_date")["ret_120"].rank(pct=True, ascending=True) * 100
     out["delta_RPS20"] = g["RPS20"].transform(lambda x: x - x.shift(10))
-    out["TrendScore"] = (0.5 * out["ret_20"] + 0.3 * out["ret_60"] + 0.2 * out["ret_120"]) * 100.0
-
-    out["EMA50"] = pd.NA
-    out["EMA200"] = pd.NA
-    out["ema200_gap_pct"] = pd.NA
-    out["ema_trend_pct"] = pd.NA
-    out["trend_ok"] = (
-        (out["ret_20"] > 0)
-        & (out["ret_60"] > 0)
-        & (out["ret_120"] > 0)
-        & (out["RPS20"] >= float(stock_rps20_min))
+    out["EMA12"] = g["close"].transform(lambda x: x.ewm(span=12, adjust=False).mean())
+    out["EMA50"] = g["close"].transform(lambda x: x.ewm(span=50, adjust=False).mean())
+    out["ema_spread"] = out["EMA12"] / out["EMA50"] - 1
+    out["recent_5d_max_vol"] = g["volume"].transform(lambda x: x.rolling(window=5, min_periods=5).max())
+    out["base_vol"] = g["volume"].transform(lambda x: x.shift(5).rolling(window=20, min_periods=20).mean())
+    out["vol_spike"] = out["recent_5d_max_vol"] / out["base_vol"] - 1
+    out["signal_cond1"] = (
+        (out["EMA12"] > out["EMA50"]) & (out["ema_spread"] <= 0.07) & (out["vol_spike"] >= 0.5)
     ).fillna(False)
-    out["StockScore"] = out["TrendScore"]
-    out["StockScoreFinal"] = out["TrendScore"]
+    out["signal_cond2"] = (
+        (out["EMA12"] > out["EMA50"])
+        & (g["EMA12"].shift(1) <= g["EMA50"].shift(1))
+        & (out["vol_spike"] >= 0.5)
+    ).fillna(False)
+    out["trend_ok"] = (out["signal_cond1"] | out["signal_cond2"]).fillna(False)
+    out["TrendScore"] = out["vol_spike"].fillna(-1) * 100.0
+    out["StockScore"] = (
+        out["signal_cond2"].astype(int) * 1000.0
+        + out["vol_spike"].fillna(-1) * 100.0
+        - out["ema_spread"].fillna(99) * 10.0
+    )
+    out["StockScoreFinal"] = out["StockScore"]
     return out
 
 
@@ -609,11 +670,18 @@ def run_strategy(config: Config) -> tuple[pd.DataFrame, pd.DataFrame, str | None
         "industry_name",
         "ts_code",
         "stock_name",
+        "is_st_stock",
         "close",
         "RPS20",
         "RPS60",
         "RPS120",
         "delta_RPS20",
+        "EMA12",
+        "EMA50",
+        "ema_spread",
+        "vol_spike",
+        "signal_cond1",
+        "signal_cond2",
         "TrendScore",
         "StockScore",
         "StockScoreFinal",
@@ -777,9 +845,14 @@ def run_strategy(config: Config) -> tuple[pd.DataFrame, pd.DataFrame, str | None
     latest["stock_data_date"] = latest["stock_data_date"].dt.strftime("%Y-%m-%d")
     latest["is_data_fresh"] = latest["data_staleness_days"] <= config.stock_data_max_staleness_days
     latest = latest.merge(industry_map, on="ts_code", how="inner")
+    latest["is_st_stock"] = latest["stock_name"].map(_is_st_stock_name)
     _record("stock_in_selected_industries", len(latest))
     for k, v in latest.groupby("industry_code").size().to_dict().items():
         _record("stock_in_selected_industries_by_ind", int(v), industry_code=str(k))
+    latest = latest[~latest["is_st_stock"]].copy()
+    _record("stock_after_st_filter", len(latest))
+    for k, v in latest.groupby("industry_code").size().to_dict().items():
+        _record("stock_after_st_filter_by_ind", int(v), industry_code=str(k))
     latest = latest[latest["trend_ok"]].copy()
     _record("stock_after_trend_filter", len(latest))
     for k, v in latest.groupby("industry_code").size().to_dict().items():
@@ -798,7 +871,7 @@ def run_strategy(config: Config) -> tuple[pd.DataFrame, pd.DataFrame, str | None
     for k, v in latest.groupby("industry_code").size().to_dict().items():
         _record("stock_after_mkt_cap_filter_by_ind", int(v), industry_code=str(k))
 
-    latest = latest.sort_values(["industry_code", "StockScoreFinal"], ascending=[True, False])
+    latest = latest.sort_values(["industry_code", "ema_spread"], ascending=[True, True])
     picks = latest.groupby("industry_code", as_index=False).head(config.stock_per_industry)
     _record("stock_final_picks", len(picks), note=f"per_industry={config.stock_per_industry}")
     for k, v in picks.groupby("industry_code").size().to_dict().items():
@@ -810,20 +883,23 @@ def run_strategy(config: Config) -> tuple[pd.DataFrame, pd.DataFrame, str | None
             "industry_name",
             "ts_code",
             "stock_name",
+            "is_st_stock",
             "close",
             "RPS20",
             "RPS60",
-            "RPS120",
             "delta_RPS20",
-            "TrendScore",
-            "StockScore",
-            "StockScoreFinal",
+            "EMA12",
+            "EMA50",
+            "ema_spread",
+            "vol_spike",
+            "signal_cond1",
+            "signal_cond2",
             "stock_data_date",
             "data_staleness_days",
             "is_data_fresh",
         ]
     ].copy()
-    out_picks = out_picks.sort_values(["industry_code", "StockScoreFinal"], ascending=[True, False]).reset_index(
+    out_picks = out_picks.sort_values(["industry_code", "ema_spread"], ascending=[True, True]).reset_index(
         drop=True
     )
 
@@ -839,7 +915,7 @@ def save_results(
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     ind_sorted = selected_industries.sort_values("IndustryScore", ascending=False).reset_index(drop=True).copy()
-    stock_sorted = stock_picks.sort_values("StockScoreFinal", ascending=False).reset_index(drop=True).copy()
+    stock_sorted = stock_picks.sort_values("ema_spread", ascending=True).reset_index(drop=True).copy()
 
     ind_out = ind_sorted.copy()
     ind_out["row_type"] = "industry"
@@ -848,14 +924,17 @@ def save_results(
 
     ind_out["ts_code"] = pd.NA
     ind_out["stock_name"] = pd.NA
+    ind_out["is_st_stock"] = pd.NA
     ind_out["close"] = pd.NA
     ind_out["RPS20"] = pd.NA
     ind_out["RPS60"] = pd.NA
-    ind_out["RPS120"] = pd.NA
     ind_out["delta_RPS20"] = pd.NA
-    ind_out["TrendScore"] = pd.NA
-    ind_out["StockScore"] = pd.NA
-    ind_out["StockScoreFinal"] = pd.NA
+    ind_out["EMA12"] = pd.NA
+    ind_out["EMA50"] = pd.NA
+    ind_out["ema_spread"] = pd.NA
+    ind_out["vol_spike"] = pd.NA
+    ind_out["signal_cond1"] = pd.NA
+    ind_out["signal_cond2"] = pd.NA
     ind_out["stock_data_date"] = pd.NA
     ind_out["data_staleness_days"] = pd.NA
     ind_out["is_data_fresh"] = pd.NA
@@ -875,14 +954,17 @@ def save_results(
         "IndustryScore",
         "ts_code",
         "stock_name",
+        "is_st_stock",
         "close",
         "RPS20",
         "RPS60",
-        "RPS120",
         "delta_RPS20",
-        "TrendScore",
-        "StockScore",
-        "StockScoreFinal",
+        "EMA12",
+        "EMA50",
+        "ema_spread",
+        "vol_spike",
+        "signal_cond1",
+        "signal_cond2",
         "stock_data_date",
         "data_staleness_days",
         "is_data_fresh",
@@ -924,7 +1006,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-date", default=datetime.today().strftime("%Y-%m-%d"))
     parser.add_argument("--output-dir", default=SCRIPT_DIR)
     parser.add_argument("--hist-cache-dir", default=".hist_cache")
-    parser.add_argument("--industry-top-n", type=int, default=10)
+    parser.add_argument("--industry-top-n", type=int, default=7)
     parser.add_argument("--industry-rps50-min", type=float, default=60.0)
     parser.add_argument("--industry-rps20-min", type=float, default=60.0)
     parser.add_argument("--industry-delta-rps20-min", type=float, default=15.0)
