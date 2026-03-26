@@ -17,6 +17,7 @@ import math
 
 import pandas as pd
 import tushare as ts
+import akshare as ak
 from ifind_http import build_client
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +32,7 @@ _TS_SW_DAILY_LOCK = threading.Lock()
 _TS_SW_DAILY_LAST_CALL = 0.0
 _TS_META_LOCK = threading.Lock()
 _TS_META_LAST_CALL = 0.0
+_AKSHARE_LOCK = threading.Lock()
 
 
 @dataclass
@@ -453,6 +455,39 @@ def _fetch_ifind_stock_hist(ts_code: str, start_date: str, end_date: str) -> pd.
         return pd.DataFrame(columns=["ts_code", "trade_date", "close", "volume"])
 
 
+def _fetch_akshare_stock_hist(ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    code = str(ts_code).split(".")[0]
+
+    def _fetch() -> pd.DataFrame:
+        with _AKSHARE_LOCK:
+            raw = ak.stock_zh_a_hist(
+                symbol=code,
+                period="daily",
+                start_date=pd.to_datetime(start_date).strftime("%Y%m%d"),
+                end_date=pd.to_datetime(end_date).strftime("%Y%m%d"),
+                adjust="qfq",
+            )
+        if raw is None or raw.empty:
+            return pd.DataFrame(columns=["ts_code", "trade_date", "close", "volume"])
+        rename_map = {"日期": "trade_date", "收盘": "close", "成交量": "volume"}
+        out = raw.rename(columns=rename_map).copy()
+        required = {"trade_date", "close", "volume"}
+        if not required.issubset(out.columns):
+            return pd.DataFrame(columns=["ts_code", "trade_date", "close", "volume"])
+        out = out[["trade_date", "close", "volume"]].copy()
+        out["trade_date"] = pd.to_datetime(out["trade_date"], errors="coerce").dt.strftime("%Y%m%d")
+        out["close"] = pd.to_numeric(out["close"], errors="coerce")
+        out["volume"] = pd.to_numeric(out["volume"], errors="coerce")
+        out["ts_code"] = ts_code
+        return out.dropna(subset=["trade_date", "close", "volume"])
+
+    try:
+        out = _run_with_retry(_fetch, max_retries=2, base_sleep=1.0, timeout=30.0)
+        return out if out is not None else pd.DataFrame(columns=["ts_code", "trade_date", "close", "volume"])
+    except Exception:
+        return pd.DataFrame(columns=["ts_code", "trade_date", "close", "volume"])
+
+
 def _fetch_tushare_stock_hist(ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
     pro = _get_tushare_pro()
 
@@ -515,6 +550,35 @@ def _fetch_ifind_sw2_hist(industry_code: str, start_date: str, end_date: str, ca
             return pd.DataFrame(columns=["industry_code", "trade_date", "close"])
         out["industry_code"] = str(industry_code)
         return out[["industry_code", "trade_date", "close"]]
+    except Exception:
+        return pd.DataFrame(columns=["industry_code", "trade_date", "close"])
+
+
+def _fetch_akshare_sw2_hist(industry_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    code = str(industry_code).split(".")[0]
+
+    def _fetch() -> pd.DataFrame:
+        with _AKSHARE_LOCK:
+            raw = ak.index_hist_sw(symbol=code, period="day")
+        if raw is None or raw.empty:
+            return pd.DataFrame(columns=["industry_code", "trade_date", "close"])
+        rename_map = {"日期": "trade_date", "收盘": "close", "代码": "industry_code"}
+        out = raw.rename(columns=rename_map).copy()
+        required = {"trade_date", "close"}
+        if not required.issubset(out.columns):
+            return pd.DataFrame(columns=["industry_code", "trade_date", "close"])
+        out["trade_date"] = pd.to_datetime(out["trade_date"], errors="coerce")
+        out["close"] = pd.to_numeric(out["close"], errors="coerce")
+        out["industry_code"] = code
+        s = pd.to_datetime(start_date)
+        e = pd.to_datetime(end_date)
+        out = out.dropna(subset=["trade_date", "close"])
+        out = out[(out["trade_date"] >= s) & (out["trade_date"] <= e)].copy()
+        return out[["industry_code", "trade_date", "close"]]
+
+    try:
+        out = _run_with_retry(_fetch, max_retries=2, base_sleep=1.0, timeout=40.0)
+        return out if out is not None else pd.DataFrame(columns=["industry_code", "trade_date", "close"])
     except Exception:
         return pd.DataFrame(columns=["industry_code", "trade_date", "close"])
 
@@ -589,6 +653,12 @@ def _fetch_tushare_sw2_hist_batch(industry_codes: list[str], start_date: str, en
 def _fetch_sw2_hist(industry_code: str, start_date: str, end_date: str, cache_dir: str) -> pd.DataFrame:
     try:
         out = _fetch_tushare_sw2_hist(industry_code, start_date, end_date)
+        if not out.empty:
+            return out
+    except Exception:
+        pass
+    try:
+        out = _fetch_akshare_sw2_hist(industry_code, start_date, end_date)
         if not out.empty:
             return out
     except Exception:
@@ -943,6 +1013,12 @@ def _is_hist_cache_stale(hist: pd.DataFrame, end_date: str, max_lag_days: int = 
 def _fetch_stock_hist(ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
     try:
         out = _fetch_tushare_stock_hist(ts_code, start_date, end_date)
+        if not out.empty:
+            return out
+    except Exception:
+        pass
+    try:
+        out = _fetch_akshare_stock_hist(ts_code, start_date, end_date)
         if not out.empty:
             return out
     except Exception:
