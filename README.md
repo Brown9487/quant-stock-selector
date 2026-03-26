@@ -10,7 +10,9 @@ Industry-first trend selection strategy.
 
 - Selects strong industries first
 - Selects stocks from chosen industries
-- Uses AkShare data
+- Uses Tushare as the primary data source
+- Uses iFind HTTP as a fallback when Tushare does not return usable data
+- Keeps local caches under `.hist_cache/` to speed up repeated runs
 - Outputs Excel reports with `industry`, `stock`, and `diagnostics` sheets
 
 Run:
@@ -26,7 +28,18 @@ Use the project virtual environment:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+export IFIND_REFRESH_TOKEN=your_refresh_token_here
+export TUSHARE_TOKEN=your_tushare_token_here
 ```
+
+## Data Source Auth
+
+The repository uses:
+
+- `TUSHARE_TOKEN` for the main data path
+- `IFIND_REFRESH_TOKEN` for fallback requests through `ifind_http.py`
+- `CODE_LIMIT` for small-scope debugging runs
+- `ALLOW_COMPONENT_SHEET_FALLBACK=1` only if you explicitly want to reuse the last Excel result as a temporary component fallback
 
 ## Ignored Runtime Files
 
@@ -37,3 +50,5 @@ Generated files are intentionally excluded from Git:
 - `run_full.log`
 - `.DS_Store`
 - `__pycache__/`
+
+If your entire `ifind` workspace is synced through iCloud, the `.hist_cache/` directory will be synced with it as well, so another machine using the same synced folder can reuse the cache directly.
