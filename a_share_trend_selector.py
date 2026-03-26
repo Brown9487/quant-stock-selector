@@ -18,16 +18,11 @@ import math
 import pandas as pd
 import tushare as ts
 import akshare as ak
-from ifind_http import build_client
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_IFIND_STOCK_META_CACHE: dict[str, pd.DataFrame] = {}
 _TUSHARE_STOCK_META_CACHE: dict[str, pd.DataFrame] = {}
-_IFIND_CLIENT = None
-_IFIND_CLIENT_LOCK = threading.Lock()
 _TS_PRO_CLIENT = None
 _TS_PRO_LOCK = threading.Lock()
-_IFIND_HIST_LOCK = threading.Lock()
 _TS_SW_DAILY_LOCK = threading.Lock()
 _TS_SW_DAILY_LAST_CALL = 0.0
 _TS_META_LOCK = threading.Lock()
@@ -97,16 +92,6 @@ def _normalize_ts_code(code: str) -> str:
     if num.startswith(("4", "8")):
         return f"{num}.BJ"
     return f"{num}.SZ"
-
-
-def _get_ifind_client():
-    global _IFIND_CLIENT
-    if _IFIND_CLIENT is not None:
-        return _IFIND_CLIENT
-    with _IFIND_CLIENT_LOCK:
-        if _IFIND_CLIENT is None:
-            _IFIND_CLIENT = build_client()
-    return _IFIND_CLIENT
 
 
 def _get_tushare_pro():
@@ -271,15 +256,6 @@ def _fetch_tushare_stock_metadata(as_of_date: str, cache_dir: str) -> pd.DataFra
         if not out.empty:
             frames.append(out.drop_duplicates(subset=["ts_code"]))
 
-    if missing_codes:
-        try:
-            ifind_meta = _fetch_ifind_stock_metadata(as_of_date, cache_dir)
-            fallback = ifind_meta[ifind_meta["industry_code"].astype(str).isin(set(missing_codes))].copy()
-            if not fallback.empty:
-                frames.append(fallback[["ts_code", "stock_name", "industry_name", "industry_code", "ifind_industry_code"]])
-        except Exception:
-            pass
-
     if not frames:
         fallback = _load_tushare_stock_meta_cache_latest(cache_dir)
         if not fallback.empty:
@@ -301,111 +277,14 @@ def _fetch_tushare_stock_metadata(as_of_date: str, cache_dir: str) -> pd.DataFra
     return meta.copy()
 
 
-def _fetch_ifind_stock_metadata(as_of_date: str, cache_dir: str) -> pd.DataFrame:
-    cached = _IFIND_STOCK_META_CACHE.get(as_of_date)
-    if cached is not None:
-        return cached.copy()
-
-    cache_path = _ifind_stock_meta_cache_path(cache_dir, as_of_date)
-    def _normalize_table(df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty:
-            return pd.DataFrame(
-                columns=[
-                    "ts_code",
-                    "stock_name",
-                    "industry_name",
-                    "industry_code",
-                    "ifind_industry_code",
-                ]
-            )
-        rename_map = {}
-        for col in df.columns:
-            col_str = str(col)
-            if col_str == "股票代码":
-                rename_map[col] = "ts_code"
-            elif col_str == "股票简称":
-                rename_map[col] = "stock_name"
-            elif col_str == "所属二级申万行业指数代码":
-                rename_map[col] = "industry_code"
-            elif col_str == "所属二级申万行业":
-                rename_map[col] = "industry_name"
-            elif col_str == "所属二级申万行业代码":
-                rename_map[col] = "ifind_industry_code"
-        out = df.rename(columns=rename_map).copy()
-        required = {"ts_code", "stock_name", "industry_code", "industry_name", "ifind_industry_code"}
-        if not required.issubset(out.columns):
-            missing = ",".join(sorted(required - set(out.columns)))
-            raise RuntimeError(f"iFind 股票元数据缺少字段: {missing}")
-        out = out[["ts_code", "stock_name", "industry_code", "industry_name", "ifind_industry_code"]].copy()
-        out["ts_code"] = out["ts_code"].astype(str).map(_normalize_ts_code)
-        out["stock_name"] = out["stock_name"].astype(str).str.strip()
-        out["industry_code"] = out["industry_code"].astype(str).str.strip()
-        out["industry_name"] = out["industry_name"].astype(str).str.strip()
-        out["ifind_industry_code"] = out["ifind_industry_code"].astype(str).str.strip()
-        out = out.dropna(subset=["ts_code", "industry_name", "industry_code"]).copy()
-        return out.drop_duplicates(subset=["ts_code"]).reset_index(drop=True)
-
-    if os.path.exists(cache_path):
-        try:
-            cached_df = _normalize_table(pd.read_csv(cache_path, dtype=str))
-            if not cached_df.empty:
-                _IFIND_STOCK_META_CACHE[as_of_date] = cached_df
-                return cached_df.copy()
-        except Exception:
-            pass
-
-    client = _get_ifind_client()
-    payload = {
-        "searchstring": "全部A股的股票代码,股票简称,所属二级申万行业指数代码,所属二级申万行业,所属二级申万行业代码",
-        "searchtype": "stock",
-    }
-    try:
-        data = _run_with_retry(
-            lambda: client.post("smart_stock_picking", payload),
-            max_retries=3,
-            base_sleep=1.0,
-            timeout=40.0,
-        )
-        table = (data.get("tables") or [{}])[0].get("table", {})
-        api_df = _normalize_table(pd.DataFrame(table))
-        if not api_df.empty:
-            os.makedirs(cache_dir, exist_ok=True)
-            api_df.to_csv(cache_path, index=False, encoding="utf-8-sig")
-            _IFIND_STOCK_META_CACHE[as_of_date] = api_df
-            return api_df.copy()
-    except Exception:
-        pass
-
-    fallback = _load_stock_meta_cache_latest(cache_dir)
-    if not fallback.empty:
-        _IFIND_STOCK_META_CACHE[as_of_date] = fallback
-        return fallback.copy()
-    raise RuntimeError("未获取到 iFind 股票元数据")
-
-
 def _load_sw2_universe(as_of_date: str, cache_dir: str) -> pd.DataFrame:
-    try:
-        meta = _fetch_tushare_stock_metadata(as_of_date, cache_dir)
-    except Exception:
-        meta = _fetch_ifind_stock_metadata(as_of_date, cache_dir)
+    meta = _fetch_tushare_stock_metadata(as_of_date, cache_dir)
     out = meta[["industry_code", "industry_name"]].drop_duplicates(subset=["industry_code"]).copy()
     out["industry_code"] = out["industry_code"].astype(str).str.extract(r"(\d{6})", expand=False)
     out = out.dropna(subset=["industry_code", "industry_name"])
     if out.empty:
         raise RuntimeError("申万二级行业列表为空")
     return out.sort_values("industry_code").reset_index(drop=True)
-
-
-def _get_ifind_industry_code(industry_code: str, as_of_date: str, cache_dir: str) -> str | None:
-    meta = _fetch_ifind_stock_metadata(as_of_date, cache_dir)
-    rel = meta.loc[meta["industry_code"].astype(str) == str(industry_code), "ifind_industry_code"].dropna()
-    if rel.empty:
-        return None
-    rel = rel.astype(str).str.strip()
-    rel = rel[rel != ""]
-    if rel.empty:
-        return None
-    return rel.mode().iloc[0]
 
 
 def _normalize_ifind_hist_df(raw_table: dict[str, object], code_col: str, with_volume: bool) -> pd.DataFrame:
@@ -424,35 +303,6 @@ def _normalize_ifind_hist_df(raw_table: dict[str, object], code_col: str, with_v
         out["volume"] = pd.to_numeric(table.get("volume"), errors="coerce")
     out = out.dropna(subset=["trade_date", "close"])
     return out
-
-
-def _fetch_ifind_stock_hist(ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-    client = _get_ifind_client()
-    payload = {
-        "codes": ts_code,
-        "indicators": "close,volume,amount",
-        "startdate": pd.to_datetime(start_date).strftime("%Y-%m-%d"),
-        "enddate": pd.to_datetime(end_date).strftime("%Y-%m-%d"),
-        "functionpara": {"Fill": "Blank"},
-    }
-    try:
-        with _IFIND_HIST_LOCK:
-            data = _run_with_retry(
-                lambda: client.post("cmd_history_quotation", payload),
-                max_retries=3,
-                base_sleep=1.0,
-                timeout=40.0,
-            )
-        table = (data.get("tables") or [{}])[0]
-        out = _normalize_ifind_hist_df(table, "ts_code", with_volume=True)
-        if out.empty:
-            return pd.DataFrame(columns=["ts_code", "trade_date", "close", "volume"])
-        out["trade_date"] = out["trade_date"].dt.strftime("%Y%m%d")
-        out["ts_code"] = ts_code
-        out["volume"] = pd.to_numeric(out["volume"], errors="coerce")
-        return out.dropna(subset=["trade_date", "close", "volume"])[["ts_code", "trade_date", "close", "volume"]]
-    except Exception:
-        return pd.DataFrame(columns=["ts_code", "trade_date", "close", "volume"])
 
 
 def _fetch_akshare_stock_hist(ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -522,36 +372,6 @@ def _throttle_tushare_sw_daily(min_interval_seconds: float = 6.5) -> None:
         if wait_seconds > 0:
             time.sleep(wait_seconds)
         _TS_SW_DAILY_LAST_CALL = time.time()
-
-
-def _fetch_ifind_sw2_hist(industry_code: str, start_date: str, end_date: str, cache_dir: str) -> pd.DataFrame:
-    ifind_code = _get_ifind_industry_code(industry_code, end_date, cache_dir)
-    if not ifind_code:
-        return pd.DataFrame(columns=["industry_code", "trade_date", "close"])
-    client = _get_ifind_client()
-    payload = {
-        "codes": ifind_code,
-        "indicators": "close",
-        "startdate": pd.to_datetime(start_date).strftime("%Y-%m-%d"),
-        "enddate": pd.to_datetime(end_date).strftime("%Y-%m-%d"),
-        "functionpara": {"Fill": "Blank"},
-    }
-    try:
-        with _IFIND_HIST_LOCK:
-            data = _run_with_retry(
-                lambda: client.post("cmd_history_quotation", payload),
-                max_retries=2,
-                base_sleep=1.0,
-                timeout=40.0,
-            )
-        table = (data.get("tables") or [{}])[0]
-        out = _normalize_ifind_hist_df(table, "industry_code", with_volume=False)
-        if out.empty:
-            return pd.DataFrame(columns=["industry_code", "trade_date", "close"])
-        out["industry_code"] = str(industry_code)
-        return out[["industry_code", "trade_date", "close"]]
-    except Exception:
-        return pd.DataFrame(columns=["industry_code", "trade_date", "close"])
 
 
 def _fetch_akshare_sw2_hist(industry_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -663,10 +483,7 @@ def _fetch_sw2_hist(industry_code: str, start_date: str, end_date: str, cache_di
             return out
     except Exception:
         pass
-    try:
-        return _fetch_ifind_sw2_hist(industry_code, start_date, end_date, cache_dir)
-    except Exception:
-        return pd.DataFrame(columns=["industry_code", "trade_date", "close"])
+    return pd.DataFrame(columns=["industry_code", "trade_date", "close"])
 
 
 def _compute_industry_factors(ind_df: pd.DataFrame) -> pd.DataFrame:
@@ -778,16 +595,16 @@ def _load_industry_data(config: Config, industry_codes: list[str], cache_dir: st
 
         still_missing = sorted(set(str(x) for x in missing_codes) - set(by_code.keys()))
         for idx, industry_code in enumerate(still_missing, start=1):
-            hist = _fetch_ifind_sw2_hist(industry_code, fetch_start_date, config.end_date, cache_dir)
+            hist = _fetch_akshare_sw2_hist(industry_code, fetch_start_date, config.end_date)
             if not hist.empty:
                 frames.append(hist)
                 _save_industry_hist_cache(hist, cache_dir)
                 ifind_hit += 1
             elif idx <= 10 or idx == len(still_missing):
-                print(f"warning: 行业 {industry_code} iFind 备用历史仍为空")
+                print(f"warning: 行业 {industry_code} AkShare 备用历史仍为空")
 
         if still_missing:
-            print(f"fetching industry hist... ifind_fallback_done={ifind_hit}/{len(still_missing)}")
+            print(f"fetching industry hist... akshare_fallback_done={ifind_hit}/{len(still_missing)}")
 
     return frames
 
@@ -820,10 +637,7 @@ def _select_top_industries(
 
 
 def _fetch_sw2_components(industry_code: str, as_of_date: str, cache_dir: str) -> pd.DataFrame:
-    try:
-        meta = _fetch_tushare_stock_metadata(as_of_date, cache_dir)
-    except Exception:
-        meta = _fetch_ifind_stock_metadata(as_of_date, cache_dir)
+    meta = _fetch_tushare_stock_metadata(as_of_date, cache_dir)
     out = meta[meta["industry_code"].astype(str) == str(industry_code)][["industry_code", "ts_code", "stock_name"]].copy()
     if out.empty:
         return pd.DataFrame(columns=["industry_code", "ts_code", "stock_name"])
@@ -1023,12 +837,6 @@ def _fetch_stock_hist(ts_code: str, start_date: str, end_date: str) -> pd.DataFr
             return out
     except Exception:
         pass
-    try:
-        out = _fetch_ifind_stock_hist(ts_code, start_date, end_date)
-        if not out.empty:
-            return out
-    except Exception:
-        pass
 
     return pd.DataFrame(columns=["ts_code", "trade_date", "close", "volume"])
 
@@ -1085,6 +893,7 @@ def _load_stock_data(config: Config, target_codes: list[str]) -> pd.DataFrame:
     total_batches = int(math.ceil(total / batch_size))
     for bi in range(total_batches):
         batch_codes = target_codes[bi * batch_size : (bi + 1) * batch_size]
+        batch_skipped_empty = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
             fut_map = {ex.submit(_load_one, ts_code): ts_code for ts_code in batch_codes}
             for fut in concurrent.futures.as_completed(fut_map):
@@ -1103,9 +912,12 @@ def _load_stock_data(config: Config, target_codes: list[str]) -> pd.DataFrame:
                     refresh_failed += 1
                 if not hist.empty:
                     frames.append(hist)
+                else:
+                    batch_skipped_empty += 1
+                    print(f"warning: {ts_code} 无可用历史数据，已跳过。")
         print(
             f"fetching stock hist... batch={bi + 1}/{total_batches} done={done}/{total} "
-            f"valid={len(frames)} cache_hit={cache_hit} refreshed={refreshed} refresh_failed={refresh_failed}"
+            f"valid={len(frames)} cache_hit={cache_hit} refreshed={refreshed} refresh_failed={refresh_failed} skipped_empty={batch_skipped_empty}"
         )
 
     if not frames:
