@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import glob
+import importlib
 import os
 import time
 import tempfile
@@ -17,16 +18,18 @@ import math
 
 import pandas as pd
 import tushare as ts
-import akshare as ak
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _TUSHARE_STOCK_META_CACHE: dict[str, pd.DataFrame] = {}
+_TUSHARE_SW2_UNIVERSE_CACHE: dict[str, pd.DataFrame] = {}
+_TUSHARE_LISTED_CODES_CACHE: dict[str, set[str]] = {}
 _TS_PRO_CLIENT = None
 _TS_PRO_LOCK = threading.Lock()
 _TS_SW_DAILY_LOCK = threading.Lock()
 _TS_SW_DAILY_LAST_CALL = 0.0
 _TS_META_LOCK = threading.Lock()
 _TS_META_LAST_CALL = 0.0
+_AKSHARE_CLIENT = None
 _AKSHARE_LOCK = threading.Lock()
 
 
@@ -108,6 +111,21 @@ def _get_tushare_pro():
     return _TS_PRO_CLIENT
 
 
+def _get_akshare():
+    global _AKSHARE_CLIENT
+    if _AKSHARE_CLIENT is not None:
+        return _AKSHARE_CLIENT
+    with _AKSHARE_LOCK:
+        if _AKSHARE_CLIENT is None:
+            try:
+                _AKSHARE_CLIENT = importlib.import_module("akshare")
+            except ModuleNotFoundError as err:
+                raise RuntimeError(
+                    "缺少 akshare 依赖，无法使用 AkShare 备用数据源；请先执行 `.venv/bin/pip install -r requirements.txt`"
+                ) from err
+    return _AKSHARE_CLIENT
+
+
 def _ifind_stock_meta_cache_path(cache_dir: str, as_of_date: str) -> str:
     d = pd.to_datetime(as_of_date, errors="coerce")
     tag = d.strftime("%Y%m%d") if pd.notna(d) else "unknown"
@@ -158,7 +176,9 @@ def _load_tushare_stock_meta_cache_latest(cache_dir: str) -> pd.DataFrame:
             df["ifind_industry_code"] = df.get("ifind_industry_code", pd.Series(dtype=str)).astype(str)
             df = df.dropna(subset=["ts_code", "industry_name", "industry_code"])
             if not df.empty:
-                return df.drop_duplicates(subset=["ts_code"]).reset_index(drop=True)
+                df = _filter_active_stock_metadata(df, as_of_date="cache")
+                if not df.empty:
+                    return df.drop_duplicates(subset=["ts_code"]).reset_index(drop=True)
         except Exception:
             continue
     return pd.DataFrame(
@@ -174,6 +194,59 @@ def _throttle_tushare_meta(min_interval_seconds: float = 0.35) -> None:
         if wait_seconds > 0:
             time.sleep(wait_seconds)
         _TS_META_LAST_CALL = time.time()
+
+
+def _is_delisted_stock_name(name: object) -> bool:
+    raw = str(name or "").strip()
+    normalized = raw.upper().replace(" ", "")
+    if not raw:
+        return False
+    return "退市" in raw or "退" in raw or normalized.endswith("DEL")
+
+
+def _load_listed_ts_codes(as_of_date: str) -> set[str]:
+    cached = _TUSHARE_LISTED_CODES_CACHE.get(as_of_date)
+    if cached is not None:
+        return set(cached)
+
+    if as_of_date == "cache":
+        return set()
+
+    pro = _get_tushare_pro()
+    try:
+        _throttle_tushare_meta()
+        raw = _run_with_retry(
+            lambda: pro.stock_basic(exchange="", list_status="L", fields="ts_code"),
+            max_retries=3,
+            timeout=20.0,
+        )
+    except Exception:
+        raw = pd.DataFrame(columns=["ts_code"])
+
+    if raw is None or raw.empty or "ts_code" not in raw.columns:
+        _TUSHARE_LISTED_CODES_CACHE[as_of_date] = set()
+        return set()
+
+    listed_codes = set(raw["ts_code"].astype(str).map(_normalize_ts_code).dropna())
+    _TUSHARE_LISTED_CODES_CACHE[as_of_date] = listed_codes
+    return set(listed_codes)
+
+
+def _filter_active_stock_metadata(meta: pd.DataFrame, as_of_date: str) -> pd.DataFrame:
+    if meta.empty:
+        return meta.copy()
+
+    out = meta.copy()
+    out["ts_code"] = out["ts_code"].astype(str).map(_normalize_ts_code)
+    out["stock_name"] = out["stock_name"].astype(str).str.strip()
+    out = out[~out["stock_name"].map(_is_delisted_stock_name)].copy()
+    if out.empty:
+        return out
+
+    listed_codes = _load_listed_ts_codes(as_of_date)
+    if listed_codes:
+        out = out[out["ts_code"].isin(listed_codes)].copy()
+    return out.reset_index(drop=True)
 
 
 def _fetch_tushare_stock_metadata(as_of_date: str, cache_dir: str) -> pd.DataFrame:
@@ -270,6 +343,7 @@ def _fetch_tushare_stock_metadata(as_of_date: str, cache_dir: str) -> pd.DataFra
     meta["industry_name"] = meta["industry_name"].astype(str).str.strip()
     meta["ifind_industry_code"] = meta["ifind_industry_code"].astype(str).str.strip()
     meta = meta.dropna(subset=["ts_code", "industry_name", "industry_code"])
+    meta = _filter_active_stock_metadata(meta, as_of_date=as_of_date)
     meta = meta.drop_duplicates(subset=["ts_code"]).reset_index(drop=True)
     os.makedirs(cache_dir, exist_ok=True)
     meta.to_csv(cache_path, index=False, encoding="utf-8-sig")
@@ -278,13 +352,40 @@ def _fetch_tushare_stock_metadata(as_of_date: str, cache_dir: str) -> pd.DataFra
 
 
 def _load_sw2_universe(as_of_date: str, cache_dir: str) -> pd.DataFrame:
-    meta = _fetch_tushare_stock_metadata(as_of_date, cache_dir)
-    out = meta[["industry_code", "industry_name"]].drop_duplicates(subset=["industry_code"]).copy()
+    cached = _TUSHARE_SW2_UNIVERSE_CACHE.get(as_of_date)
+    if cached is not None:
+        return cached.copy()
+
+    pro = _get_tushare_pro()
+    try:
+        _throttle_tushare_meta()
+        universe = _run_with_retry(
+            lambda: pro.index_classify(
+                level="L2",
+                src="SW2021",
+                fields="index_code,industry_name,level",
+            ),
+            max_retries=3,
+            timeout=20.0,
+        )
+    except Exception:
+        universe = pd.DataFrame(columns=["index_code", "industry_name", "level"])
+
+    if universe is None or universe.empty:
+        meta = _fetch_tushare_stock_metadata(as_of_date, cache_dir)
+        out = meta[["industry_code", "industry_name"]].drop_duplicates(subset=["industry_code"]).copy()
+    else:
+        out = universe.rename(columns={"index_code": "industry_code"}).copy()
+        out = out[["industry_code", "industry_name"]]
+
     out["industry_code"] = out["industry_code"].astype(str).str.extract(r"(\d{6})", expand=False)
-    out = out.dropna(subset=["industry_code", "industry_name"])
+    out["industry_name"] = out["industry_name"].astype(str).str.strip()
+    out = out.dropna(subset=["industry_code", "industry_name"]).drop_duplicates(subset=["industry_code"])
     if out.empty:
         raise RuntimeError("申万二级行业列表为空")
-    return out.sort_values("industry_code").reset_index(drop=True)
+    out = out.sort_values("industry_code").reset_index(drop=True)
+    _TUSHARE_SW2_UNIVERSE_CACHE[as_of_date] = out
+    return out.copy()
 
 
 def _normalize_ifind_hist_df(raw_table: dict[str, object], code_col: str, with_volume: bool) -> pd.DataFrame:
@@ -309,6 +410,7 @@ def _fetch_akshare_stock_hist(ts_code: str, start_date: str, end_date: str) -> p
     code = str(ts_code).split(".")[0]
 
     def _fetch() -> pd.DataFrame:
+        ak = _get_akshare()
         with _AKSHARE_LOCK:
             raw = ak.stock_zh_a_hist(
                 symbol=code,
@@ -378,6 +480,7 @@ def _fetch_akshare_sw2_hist(industry_code: str, start_date: str, end_date: str) 
     code = str(industry_code).split(".")[0]
 
     def _fetch() -> pd.DataFrame:
+        ak = _get_akshare()
         with _AKSHARE_LOCK:
             raw = ak.index_hist_sw(symbol=code, period="day")
         if raw is None or raw.empty:

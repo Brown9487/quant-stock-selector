@@ -11,7 +11,7 @@ Industry-first trend selection strategy.
 - Selects strong industries first
 - Selects stocks from chosen industries
 - Uses Tushare as the primary data source
-- Uses iFind HTTP as a fallback when Tushare does not return usable data
+- Uses AkShare as a fallback when Tushare does not return usable data
 - Keeps local caches under `.hist_cache/` to speed up repeated runs
 - Outputs Excel reports with `industry`, `stock`, and `diagnostics` sheets
 
@@ -28,7 +28,6 @@ Use the project virtual environment:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-export IFIND_REFRESH_TOKEN=your_refresh_token_here
 export TUSHARE_TOKEN=your_tushare_token_here
 ```
 
@@ -37,7 +36,7 @@ export TUSHARE_TOKEN=your_tushare_token_here
 The repository uses:
 
 - `TUSHARE_TOKEN` for the main data path
-- `IFIND_REFRESH_TOKEN` for fallback requests through `ifind_http.py`
+- AkShare as the fallback data source from `requirements.txt`
 - `CODE_LIMIT` for small-scope debugging runs
 - `ALLOW_COMPONENT_SHEET_FALLBACK=1` only if you explicitly want to reuse the last Excel result as a temporary component fallback
 
