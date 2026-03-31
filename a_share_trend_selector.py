@@ -595,11 +595,9 @@ def _compute_industry_factors(ind_df: pd.DataFrame) -> pd.DataFrame:
 
     out["ret_20_ind"] = g["close"].transform(lambda x: x / x.shift(20) - 1)
     out["ret_50_ind"] = g["close"].transform(lambda x: x / x.shift(50) - 1)
-    out["ret_120_ind"] = g["close"].transform(lambda x: x / x.shift(120) - 1)
 
     out["RPS20_ind"] = out.groupby("trade_date")["ret_20_ind"].rank(pct=True, ascending=True) * 100
     out["RPS50_ind"] = out.groupby("trade_date")["ret_50_ind"].rank(pct=True, ascending=True) * 100
-    out["RPS120_ind"] = out.groupby("trade_date")["ret_120_ind"].rank(pct=True, ascending=True) * 100
 
     out["delta_RPS20_ind"] = g["RPS20_ind"].transform(lambda x: x - x.shift(10))
     return out
@@ -1038,10 +1036,8 @@ def _compute_stock_factors(stock_df: pd.DataFrame, stock_rps20_min: float) -> pd
     g = out.groupby("ts_code")
     out["ret_20"] = g["close"].transform(lambda x: x / x.shift(20) - 1)
     out["ret_60"] = g["close"].transform(lambda x: x / x.shift(60) - 1)
-    out["ret_120"] = g["close"].transform(lambda x: x / x.shift(120) - 1)
     out["RPS20"] = out.groupby("trade_date")["ret_20"].rank(pct=True, ascending=True) * 100
     out["RPS60"] = out.groupby("trade_date")["ret_60"].rank(pct=True, ascending=True) * 100
-    out["RPS120"] = out.groupby("trade_date")["ret_120"].rank(pct=True, ascending=True) * 100
     out["delta_RPS20"] = g["RPS20"].transform(lambda x: x - x.shift(10))
     out["EMA12"] = g["close"].transform(lambda x: x.ewm(span=12, adjust=False).mean())
     out["EMA50"] = g["close"].transform(lambda x: x.ewm(span=50, adjust=False).mean())
@@ -1083,7 +1079,6 @@ def run_strategy(config: Config) -> tuple[pd.DataFrame, pd.DataFrame, str | None
         "close",
         "RPS20",
         "RPS60",
-        "RPS120",
         "delta_RPS20",
         "EMA12",
         "EMA50",
