@@ -660,7 +660,7 @@ def _load_industry_data(config: Config, industry_codes: list[str], cache_dir: st
         if (
             not cached.empty
             and len(cached) >= min_history_rows
-            and not _is_hist_cache_stale(cached, config.end_date, max_lag_days=1)
+            and not _is_hist_cache_stale(cached, config.end_date, max_lag_days=0)
         ):
             frames.append(cached)
             cache_hit += 1
