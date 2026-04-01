@@ -21,7 +21,7 @@ import tushare as ts
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _TUSHARE_STOCK_META_CACHE: dict[str, pd.DataFrame] = {}
-_TUSHARE_SW2_UNIVERSE_CACHE: dict[str, pd.DataFrame] = {}
+_TUSHARE_SW1_UNIVERSE_CACHE: dict[str, pd.DataFrame] = {}
 _TUSHARE_LISTED_CODES_CACHE: dict[str, set[str]] = {}
 _TS_PRO_CLIENT = None
 _TS_PRO_LOCK = threading.Lock()
@@ -39,7 +39,7 @@ class Config:
     end_date: str
     output_dir: str = SCRIPT_DIR
     hist_cache_dir: str = ".hist_cache"
-    industry_top_n: int = 7
+    industry_top_n: int = 10
     industry_rps50_min: float = 60.0
     industry_rps20_min: float = 60.0
     industry_delta_rps20_min: float = 15.0
@@ -269,7 +269,7 @@ def _fetch_tushare_stock_metadata(as_of_date: str, cache_dir: str) -> pd.DataFra
         _throttle_tushare_meta()
         universe = _run_with_retry(
             lambda: pro.index_classify(
-                level="L2",
+                level="L1",
                 src="SW2021",
                 fields="index_code,industry_name,level",
             ),
@@ -284,14 +284,14 @@ def _fetch_tushare_stock_metadata(as_of_date: str, cache_dir: str) -> pd.DataFra
         if not fallback.empty:
             _TUSHARE_STOCK_META_CACHE[as_of_date] = fallback
             return fallback.copy()
-        raise RuntimeError("未获取到 Tushare 申万二级行业列表")
+        raise RuntimeError("未获取到 Tushare 申万一级行业列表")
 
     universe = universe.copy()
     universe["industry_code"] = universe["index_code"].astype(str).str.extract(r"(\d{6})", expand=False)
     universe["industry_name"] = universe["industry_name"].astype(str).str.strip()
     universe = universe.dropna(subset=["industry_code", "industry_name"]).drop_duplicates(subset=["industry_code"])
     if universe.empty:
-        raise RuntimeError("Tushare 申万二级行业列表为空")
+        raise RuntimeError("Tushare 申万一级行业列表为空")
 
     frames: list[pd.DataFrame] = []
     missing_codes: list[str] = []
@@ -300,9 +300,9 @@ def _fetch_tushare_stock_metadata(as_of_date: str, cache_dir: str) -> pd.DataFra
             _throttle_tushare_meta()
             comp = _run_with_retry(
                 lambda ic=industry_code: pro.index_member_all(
-                    l2_code=f"{ic}.SI",
+                    l1_code=f"{ic}.SI",
                     is_new="Y",
-                    fields="l2_code,l2_name,ts_code,name,is_new",
+                    fields="l1_code,l1_name,ts_code,name,is_new",
                 ),
                 max_retries=3,
                 timeout=25.0,
@@ -314,8 +314,8 @@ def _fetch_tushare_stock_metadata(as_of_date: str, cache_dir: str) -> pd.DataFra
             continue
         out = comp.rename(
             columns={
-                "l2_code": "industry_code",
-                "l2_name": "industry_name",
+                "l1_code": "industry_code",
+                "l1_name": "industry_name",
                 "name": "stock_name",
             }
         ).copy()
@@ -351,8 +351,8 @@ def _fetch_tushare_stock_metadata(as_of_date: str, cache_dir: str) -> pd.DataFra
     return meta.copy()
 
 
-def _load_sw2_universe(as_of_date: str, cache_dir: str) -> pd.DataFrame:
-    cached = _TUSHARE_SW2_UNIVERSE_CACHE.get(as_of_date)
+def _load_sw1_universe(as_of_date: str, cache_dir: str) -> pd.DataFrame:
+    cached = _TUSHARE_SW1_UNIVERSE_CACHE.get(as_of_date)
     if cached is not None:
         return cached.copy()
 
@@ -361,7 +361,7 @@ def _load_sw2_universe(as_of_date: str, cache_dir: str) -> pd.DataFrame:
         _throttle_tushare_meta()
         universe = _run_with_retry(
             lambda: pro.index_classify(
-                level="L2",
+                level="L1",
                 src="SW2021",
                 fields="index_code,industry_name,level",
             ),
@@ -382,9 +382,9 @@ def _load_sw2_universe(as_of_date: str, cache_dir: str) -> pd.DataFrame:
     out["industry_name"] = out["industry_name"].astype(str).str.strip()
     out = out.dropna(subset=["industry_code", "industry_name"]).drop_duplicates(subset=["industry_code"])
     if out.empty:
-        raise RuntimeError("申万二级行业列表为空")
+        raise RuntimeError("申万一级行业列表为空")
     out = out.sort_values("industry_code").reset_index(drop=True)
-    _TUSHARE_SW2_UNIVERSE_CACHE[as_of_date] = out
+    _TUSHARE_SW1_UNIVERSE_CACHE[as_of_date] = out
     return out.copy()
 
 
@@ -476,7 +476,7 @@ def _throttle_tushare_sw_daily(min_interval_seconds: float = 6.5) -> None:
         _TS_SW_DAILY_LAST_CALL = time.time()
 
 
-def _fetch_akshare_sw2_hist(industry_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+def _fetch_akshare_sw1_hist(industry_code: str, start_date: str, end_date: str) -> pd.DataFrame:
     code = str(industry_code).split(".")[0]
 
     def _fetch() -> pd.DataFrame:
@@ -506,7 +506,7 @@ def _fetch_akshare_sw2_hist(industry_code: str, start_date: str, end_date: str) 
         return pd.DataFrame(columns=["industry_code", "trade_date", "close"])
 
 
-def _fetch_tushare_sw2_hist(industry_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+def _fetch_tushare_sw1_hist(industry_code: str, start_date: str, end_date: str) -> pd.DataFrame:
     pro = _get_tushare_pro()
     _throttle_tushare_sw_daily()
     raw = _run_with_retry(
@@ -532,7 +532,7 @@ def _fetch_tushare_sw2_hist(industry_code: str, start_date: str, end_date: str) 
     return out[["industry_code", "trade_date", "close"]]
 
 
-def _fetch_tushare_sw2_hist_batch(industry_codes: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+def _fetch_tushare_sw1_hist_batch(industry_codes: list[str], start_date: str, end_date: str) -> pd.DataFrame:
     if not industry_codes:
         return pd.DataFrame(columns=["industry_code", "trade_date", "close"])
     pro = _get_tushare_pro()
@@ -573,15 +573,15 @@ def _fetch_tushare_sw2_hist_batch(industry_codes: list[str], start_date: str, en
     return out[["industry_code", "trade_date", "close"]]
 
 
-def _fetch_sw2_hist(industry_code: str, start_date: str, end_date: str, cache_dir: str) -> pd.DataFrame:
+def _fetch_sw1_hist(industry_code: str, start_date: str, end_date: str, cache_dir: str) -> pd.DataFrame:
     try:
-        out = _fetch_tushare_sw2_hist(industry_code, start_date, end_date)
+        out = _fetch_tushare_sw1_hist(industry_code, start_date, end_date)
         if not out.empty:
             return out
     except Exception:
         pass
     try:
-        out = _fetch_akshare_sw2_hist(industry_code, start_date, end_date)
+        out = _fetch_akshare_sw1_hist(industry_code, start_date, end_date)
         if not out.empty:
             return out
     except Exception:
@@ -673,7 +673,7 @@ def _load_industry_data(config: Config, industry_codes: list[str], cache_dir: st
 
     if missing_codes:
         try:
-            batch = _fetch_tushare_sw2_hist_batch(missing_codes, fetch_start_date, config.end_date)
+            batch = _fetch_tushare_sw1_hist_batch(missing_codes, fetch_start_date, config.end_date)
         except Exception as err:
             print(f"warning: Tushare 批量行业历史拉取失败: {err}")
             batch = pd.DataFrame(columns=["industry_code", "trade_date", "close"])
@@ -696,7 +696,7 @@ def _load_industry_data(config: Config, industry_codes: list[str], cache_dir: st
 
         still_missing = sorted(set(str(x) for x in missing_codes) - set(by_code.keys()))
         for idx, industry_code in enumerate(still_missing, start=1):
-            hist = _fetch_akshare_sw2_hist(industry_code, fetch_start_date, config.end_date)
+            hist = _fetch_akshare_sw1_hist(industry_code, fetch_start_date, config.end_date)
             if not hist.empty:
                 frames.append(hist)
                 _save_industry_hist_cache(hist, cache_dir)
@@ -737,7 +737,7 @@ def _select_top_industries(
     ].reset_index(drop=True)
 
 
-def _fetch_sw2_components(industry_code: str, as_of_date: str, cache_dir: str) -> pd.DataFrame:
+def _fetch_sw1_components(industry_code: str, as_of_date: str, cache_dir: str) -> pd.DataFrame:
     meta = _fetch_tushare_stock_metadata(as_of_date, cache_dir)
     out = meta[meta["industry_code"].astype(str) == str(industry_code)][["industry_code", "ts_code", "stock_name"]].copy()
     if out.empty:
@@ -828,7 +828,7 @@ def _fetch_components_with_cache(
     os.makedirs(_component_cache_dir(cache_dir), exist_ok=True)
 
     try:
-        fresh = _fetch_sw2_components(industry_code, as_of_date=as_of_date, cache_dir=cache_dir)
+        fresh = _fetch_sw1_components(industry_code, as_of_date=as_of_date, cache_dir=cache_dir)
         if not fresh.empty:
             fresh = fresh.copy()
             fresh["industry_code"] = fresh["industry_code"].astype(str)
@@ -1095,7 +1095,7 @@ def run_strategy(config: Config) -> tuple[pd.DataFrame, pd.DataFrame, str | None
     ]
 
     cache_dir = _resolve_cache_dir(config.hist_cache_dir)
-    universe = _load_sw2_universe(config.end_date, cache_dir)
+    universe = _load_sw1_universe(config.end_date, cache_dir)
     _record("industry_universe", len(universe))
     print(f"industry universe: {len(universe)}")
 
@@ -1285,42 +1285,17 @@ def save_results(
     os.makedirs(output_dir, exist_ok=True)
     ind_sorted = selected_industries.sort_values("IndustryScore", ascending=False).reset_index(drop=True).copy()
     stock_sorted = stock_picks.sort_values("ema_spread", ascending=True).reset_index(drop=True).copy()
-
-    ind_out = ind_sorted.copy()
-    ind_out["row_type"] = "industry"
-    stock_out = stock_sorted.copy()
-    stock_out["row_type"] = "stock"
-
-    ind_out["ts_code"] = pd.NA
-    ind_out["stock_name"] = pd.NA
-    ind_out["is_st_stock"] = pd.NA
-    ind_out["close"] = pd.NA
-    ind_out["RPS20"] = pd.NA
-    ind_out["RPS60"] = pd.NA
-    ind_out["delta_RPS20"] = pd.NA
-    ind_out["EMA12"] = pd.NA
-    ind_out["EMA50"] = pd.NA
-    ind_out["ema_spread"] = pd.NA
-    ind_out["vol_spike"] = pd.NA
-    ind_out["signal_cond1"] = pd.NA
-    ind_out["signal_cond2"] = pd.NA
-    ind_out["stock_data_date"] = pd.NA
-    ind_out["data_staleness_days"] = pd.NA
-    ind_out["is_data_fresh"] = pd.NA
-
-    stock_out["RPS20_ind"] = pd.NA
-    stock_out["RPS50_ind"] = pd.NA
-    stock_out["delta_RPS20_ind"] = pd.NA
-    stock_out["IndustryScore"] = pd.NA
-
-    cols = [
-        "row_type",
+    industry_cols = [
         "industry_code",
         "industry_name",
         "RPS20_ind",
         "RPS50_ind",
         "delta_RPS20_ind",
         "IndustryScore",
+    ]
+    stock_cols = [
+        "industry_code",
+        "industry_name",
         "ts_code",
         "stock_name",
         "is_st_stock",
@@ -1338,9 +1313,8 @@ def save_results(
         "data_staleness_days",
         "is_data_fresh",
     ]
-
-    industry_sheet = ind_out[cols].copy()
-    stock_sheet = stock_out[cols].copy()
+    industry_sheet = ind_sorted[industry_cols].copy()
+    stock_sheet = stock_sorted[stock_cols].copy()
     run_date = datetime.now().strftime("%Y%m%d")
     close_date = "NA"
     if stock_close_date:
@@ -1375,7 +1349,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-date", default=datetime.today().strftime("%Y-%m-%d"))
     parser.add_argument("--output-dir", default=SCRIPT_DIR)
     parser.add_argument("--hist-cache-dir", default=".hist_cache")
-    parser.add_argument("--industry-top-n", type=int, default=7)
+    parser.add_argument("--industry-top-n", type=int, default=10)
     parser.add_argument("--industry-rps50-min", type=float, default=60.0)
     parser.add_argument("--industry-rps20-min", type=float, default=60.0)
     parser.add_argument("--industry-delta-rps20-min", type=float, default=15.0)
